@@ -1,0 +1,593 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{authblk}
+\usepackage{fancyhdr}
+\usepackage{caption}
+\usepackage{float}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!50!black,
+    citecolor=blue!50!black,
+    urlcolor=blue!50!black,
+    pdftitle={Attitude Estimation and Magnetometer Calibration in the STM32 MPU9250 EKF Module},
+    pdfauthor={Technical Analysis}
+}
+
+\definecolor{codebg}{RGB}{245,245,245}
+\lstset{
+    backgroundcolor=\color{codebg},
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    frame=single,
+    numbers=left,
+    numberstyle=\tiny\color{gray},
+    keywordstyle=\color{blue!60!black}\bfseries,
+    commentstyle=\color{green!40!black}\itshape,
+    xleftmargin=1.2em,
+    framexleftmargin=1.2em
+}
+
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+
+\newcommand{\vect}[1]{\bm{#1}}
+\newcommand{\mat}[1]{\bm{#1}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\quat}{\vect{q}}
+\newcommand{\transpose}{^{\mathsf{T}}}
+\newcommand{\skewm}[1]{\left[#1\times\right]}
+
+\title{\bfseries Attitude Estimation and Magnetometer Calibration \\
+in the \texttt{43-STM32Fxxx\_MPU9250\_EKF} Module:\\
+A Multiplicative Extended Kalman Filter with Ellipsoid Hard/Soft-Iron Calibration}
+
+\author{Prepared by Claude (Anthropic) --- Source Code Analysis}
+\date{\today}
+
+\setlength{\headheight}{14pt}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{Attitude EKF \& Magnetometer Calibration}
+\fancyhead[R]{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This paper presents a detailed mathematical analysis of the navigation and sensor-fusion algorithms implemented in the \texttt{43-STM32Fxxx\_MPU9250\_EKF} firmware module of the \texttt{stm32\_utilities} repository. The module implements a hardware-agnostic \emph{multiplicative Extended Kalman Filter} (MEKF) for real-time attitude (roll, pitch, yaw) estimation from a 9-axis MPU9250 inertial/magnetic sensor, together with an \emph{ellipsoid least-squares fitting} routine for hard-iron and soft-iron magnetometer calibration, solved through Gauss--Jordan elimination on the associated normal equations. We derive and explain, symbol by symbol, the quaternion kinematics, the linearized error-state dynamics, the discrete-time covariance propagation, the vector-observation measurement update shared by the accelerometer and magnetometer corrections, and the ellipsoid-fitting calibration model. The presentation follows the exact structure of the source code (\texttt{ekf.c}, \texttt{ekf.h}, \texttt{magcal.c}, \texttt{magcal.h}, \texttt{Gauss\_elimination.c}, \texttt{imu\_port.c}) so that each equation can be traced back to its implementation.
+\end{abstract}
+
+\tableofcontents
+
+% =====================================================================
+\section{Introduction and System Overview}
+% =====================================================================
+
+The firmware module under analysis implements a classical low-cost \emph{Attitude and Heading Reference System} (AHRS) pipeline for an STM32 microcontroller interfaced with an MPU9250 inertial measurement unit (3-axis gyroscope, 3-axis accelerometer, 3-axis magnetometer). The pipeline consists of two mathematically independent, but functionally connected, algorithms:
+
+\begin{enumerate}[label=(\roman*)]
+    \item A \textbf{6-state multiplicative Extended Kalman Filter} (\texttt{ekf.c}/\texttt{ekf.h}) that fuses angular-rate (gyroscope) integration with vector observations of gravity (accelerometer) and of the local magnetic field (magnetometer) to produce a drift-corrected orientation quaternion and gyroscope bias estimate.
+    \item A \textbf{least-squares ellipsoid fit} (\texttt{magcal.c}/\texttt{magcal.h}), solved via \textbf{Gauss--Jordan elimination} (\texttt{Gauss\_elimination.c}), that removes hard-iron and soft-iron distortion from raw magnetometer readings prior to their use in the EKF.
+\end{enumerate}
+
+The hardware-facing layer (\texttt{imu\_port.c}) merely converts raw sensor register values into physical units (rad/s for the gyroscope, $g$ for the accelerometer, calibrated unit-vector for the magnetometer) and is not part of the estimation mathematics; it is described briefly in Section~\ref{sec:port} for completeness.
+
+\begin{remark}[Frame conventions]
+The filter uses a quaternion $\quat$ that rotates vectors from the \emph{body} frame to the \emph{navigation} frame, in an ENU-like navigation frame in which a level board reads $+1\,g$ on the vertical (Z) axis, consistent with the raw output of an MPU9250 lying flat.
+\end{remark}
+
+% =====================================================================
+\section{Attitude Representation and Kinematics}
+% =====================================================================
+
+\subsection{Quaternion convention}
+
+Orientation is represented by a unit (Hamilton, scalar-first) quaternion
+\begin{equation}
+    \quat = \begin{bmatrix} w & x & y & z \end{bmatrix}\transpose, \qquad \lVert \quat \rVert = 1,
+\end{equation}
+where $w$ is the scalar part and $(x,y,z)$ the vector part. The quaternion $\quat$ represents the rotation that maps a vector expressed in the \emph{body} frame into the \emph{navigation} frame.
+
+The Hamilton product of two quaternions $\vect a=[a_0,a_1,a_2,a_3]\transpose$ and $\vect b=[b_0,b_1,b_2,b_3]\transpose$, denoted $\vect r = \vect a \otimes \vect b$, is
+\begin{align}
+r_0 &= a_0 b_0 - a_1 b_1 - a_2 b_2 - a_3 b_3, \\
+r_1 &= a_0 b_1 + a_1 b_0 + a_2 b_3 - a_3 b_2, \\
+r_2 &= a_0 b_2 - a_1 b_3 + a_2 b_0 + a_3 b_1, \\
+r_3 &= a_0 b_3 + a_1 b_2 - a_2 b_1 + a_3 b_0 .
+\end{align}
+This is implemented verbatim in \texttt{quat\_mul()}.
+
+\subsection{Rotation matrix from quaternion}
+
+The corresponding body-to-navigation rotation matrix $\mat R(\quat)\in\R^{3\times3}$ (function \texttt{quat\_to\_R}) is
+\begin{equation}
+\mat R(\quat) =
+\begin{bmatrix}
+1-2(y^2+z^2) & 2(xy-wz) & 2(xz+wy) \\
+2(xy+wz) & 1-2(x^2+z^2) & 2(yz-wx) \\
+2(xz-wy) & 2(yz+wx) & 1-2(x^2+y^2)
+\end{bmatrix}.
+\label{eq:R}
+\end{equation}
+A navigation-frame vector $\vect v_{\text{nav}}$ is mapped into the body frame by $\mat R\transpose \vect v_{\text{nav}}$ (function \texttt{R\_transpose\_mul}), since $\mat R\transpose = \mat R^{-1}$ for an orthonormal rotation matrix.
+
+\subsection{Quaternion kinematics}
+
+The continuous-time attitude kinematics are governed by
+\begin{equation}
+\dot{\quat} = \tfrac{1}{2}\, \quat \otimes \begin{bmatrix}0\\ \vect\omega\end{bmatrix},
+\label{eq:qdot}
+\end{equation}
+where $\vect\omega = [\omega_x,\omega_y,\omega_z]\transpose$ is the body-frame angular velocity. The filter integrates \eqref{eq:qdot} using a first-order (small-angle) discretization: for a sample interval $\Delta t$,
+\begin{equation}
+\delta\quat = \begin{bmatrix} 1 \\ \tfrac12\omega_x\Delta t \\ \tfrac12\omega_y\Delta t \\ \tfrac12\omega_z\Delta t\end{bmatrix},
+\qquad
+\quat_{k+1} = \operatorname{normalize}\!\left(\quat_k \otimes \delta\quat\right).
+\label{eq:qint}
+\end{equation}
+This is a first-order truncation of the exact quaternion exponential $\exp\!\big(\tfrac12[0,\vect\omega]\Delta t\big)$, adequate at typical IMU sample rates. Re-normalization after every product compensates for the truncation error and for floating-point drift, keeping $\lVert \quat\rVert=1$ to numerical precision.
+
+% =====================================================================
+\section{The Multiplicative Extended Kalman Filter (MEKF)}
+% =====================================================================
+
+\subsection{State representation: nominal state and error state}
+
+A defining feature of the filter is that the Kalman filter's state vector does \emph{not} contain the quaternion directly. Placing a 4-parameter, norm-constrained quaternion inside an unconstrained linear-Gaussian Kalman state would make the covariance singular and require ad-hoc renormalization of the covariance itself. Instead, following the classical multiplicative EKF formulation (Lefferts--Shuster--Markley), the filter separates:
+
+\begin{itemize}
+    \item a \textbf{nominal state}, carried outside the Kalman recursion:
+    \begin{equation}
+        \quat \in \R^4,\ \lVert\quat\rVert=1, \qquad \hat{\vect b}\in\R^3,
+    \end{equation}
+    i.e. the current best-estimate quaternion and gyro-bias estimate;
+    \item an \textbf{error state}, the actual $6$-dimensional Kalman state $\delta\vect x \in \R^6$:
+    \begin{equation}
+        \delta\vect x = \begin{bmatrix}\delta\vect\theta \\ \delta\vect b\end{bmatrix}, \qquad
+        \delta\vect\theta = \begin{bmatrix}\delta\theta_x\\\delta\theta_y\\\delta\theta_z\end{bmatrix}\in\R^3,\quad
+        \delta\vect b = \begin{bmatrix}\delta b_x\\\delta b_y\\\delta b_z\end{bmatrix}\in\R^3 .
+    \end{equation}
+\end{itemize}
+
+The true attitude is related to the nominal attitude through a small-angle multiplicative correction,
+\begin{equation}
+\quat_{\text{true}} \;\approx\; \quat \otimes \delta\quat(\delta\vect\theta), \qquad
+\delta\quat(\delta\vect\theta) \approx \begin{bmatrix}1\\ \tfrac12\delta\theta_x\\ \tfrac12\delta\theta_y\\ \tfrac12\delta\theta_z\end{bmatrix},
+\label{eq:mekf-correction}
+\end{equation}
+which is exactly the update rule applied after every measurement correction (Section~\ref{sec:update}). This is the mathematical meaning of ``multiplicative'': the error is \emph{composed} onto the nominal quaternion by quaternion multiplication rather than added component-wise, so unit norm is preserved automatically (up to renormalization for numerical robustness).
+
+The filter's error covariance
+\begin{equation}
+\mat P \in \R^{6\times 6}, \qquad \mat P = \begin{bmatrix}
+\mat P_{\theta\theta} & \mat P_{\theta b} \\
+\mat P_{b\theta} & \mat P_{bb}
+\end{bmatrix}
+\end{equation}
+is stored row-major as a flat 36-element array (\texttt{f->P[36]}) and is initialized to
+\begin{equation}
+\mat P_0 = \operatorname{diag}\big(\underbrace{\sigma_{\theta,0}^2,\sigma_{\theta,0}^2,\sigma_{\theta,0}^2}_{0.1\ \mathrm{rad}^2},\ \underbrace{\sigma_{b,0}^2,\sigma_{b,0}^2,\sigma_{b,0}^2}_{0.01\ (\mathrm{rad/s})^2}\big)
+\end{equation}
+in \texttt{ekf\_init}, reflecting moderate initial uncertainty in attitude and small initial uncertainty in bias.
+
+\subsection{Filter configuration parameters}
+
+The structure \texttt{ekf\_cfg\_t} exposes four scalar noise parameters and a reference vector, summarized in Table~\ref{tab:cfg}.
+
+\begin{table}[H]
+\centering
+\caption{Filter configuration parameters (\texttt{ekf\_cfg\_t}).}
+\label{tab:cfg}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Symbol & Field & Units & Meaning \\
+\midrule
+$\sigma_{\text{gyro}}$ & \texttt{gyro\_noise} & $\mathrm{rad\,s^{-1}/\sqrt{Hz}}$ & Gyroscope angle-random-walk (white noise) density \\
+$\sigma_{\text{bias}}$ & \texttt{bias\_noise} & $\mathrm{rad\,s^{-2}/\sqrt{Hz}}$ & Gyro bias random-walk (rate random walk) density \\
+$\sigma_{\text{acc}}$ & \texttt{accel\_noise} & normalized & Isotropic accelerometer measurement-noise variance \\
+$\sigma_{\text{mag}}$ & \texttt{mag\_noise} & normalized & Isotropic magnetometer measurement-noise variance \\
+$\vect r_{\text{mag}}$ & \texttt{mag\_ref[3]} & unit vector & Local magnetic field direction, navigation frame \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Time update: state propagation (\texttt{ekf\_predict})}
+
+\subsubsection{Bias-corrected rate and quaternion propagation}
+
+Given a raw gyroscope sample $\vect\omega_{\text{meas}}$ and time step $\Delta t$, the bias-corrected angular rate is
+\begin{equation}
+\vect\omega = \vect\omega_{\text{meas}} - \hat{\vect b}.
+\end{equation}
+The nominal quaternion is propagated using \eqref{eq:qint} with this bias-corrected $\vect\omega$.
+
+\subsubsection{Linearized error-state dynamics}
+
+Differentiating the multiplicative error model \eqref{eq:mekf-correction} and the true angular-rate/bias relationship $\hat{\vect b} = \vect b_{\text{true}} - \delta\vect b$ yields the (continuous-time, linearized) error dynamics
+\begin{align}
+\dot{\delta\vect\theta} &= -\skewm{\vect\omega}\,\delta\vect\theta \;-\; \delta\vect b, \label{eq:err-dyn-theta}\\
+\dot{\delta\vect b} &= \vect 0, \label{eq:err-dyn-b}
+\end{align}
+where $\skewm{\vect\omega}$ is the skew-symmetric \emph{cross-product matrix} of $\vect\omega=[\omega_x,\omega_y,\omega_z]\transpose$,
+\begin{equation}
+\skewm{\vect\omega} \;=\;
+\begin{bmatrix}
+0 & -\omega_z & \omega_y \\
+\omega_z & 0 & -\omega_x \\
+-\omega_y & \omega_x & 0
+\end{bmatrix},
+\qquad \skewm{\vect\omega}\,\vect v = \vect\omega\times\vect v \ \ \forall\, \vect v\in\R^3 .
+\label{eq:skew}
+\end{equation}
+Equation~\eqref{eq:err-dyn-theta} states that the attitude error rotates with the true body rate and is driven by any uncorrected bias error; \eqref{eq:err-dyn-b} models the bias error as constant over the (short) propagation interval, its slow variation being captured instead through injected process noise (below), i.e. a random-walk model.
+
+\subsubsection{Discrete state-transition matrix}
+
+Writing the linear system $\dot{\delta\vect x} = \mat F\,\delta\vect x$ with
+\begin{equation}
+\mat F = \begin{bmatrix} -\skewm{\vect\omega} & -\mat I_3 \\ \mat 0_3 & \mat 0_3 \end{bmatrix} \in \R^{6\times6},
+\end{equation}
+the code uses the first-order discretization $\mat\Phi \approx \mat I_6 + \mat F\,\Delta t$, i.e.
+\begin{equation}
+\mat\Phi =
+\left[
+\begin{array}{c|c}
+\mat I_3 - \skewm{\vect\omega}\,\Delta t & -\Delta t\, \mat I_3 \\ \hline
+\mat 0_3 & \mat I_3
+\end{array}
+\right].
+\label{eq:Phi}
+\end{equation}
+This $6\times 6$ matrix is assembled explicitly in \texttt{ekf\_predict} (variable \texttt{Phi}), with the $3\times3$ upper-left block containing $\pm\omega_i\Delta t$ terms exactly as in \eqref{eq:skew}, and the upper-right block equal to $-\Delta t\,\mat I_3$.
+
+\subsubsection{Covariance time update}
+
+The error covariance is propagated by the standard linear Kalman time-update equation
+\begin{equation}
+\mat P^{-} = \mat\Phi\, \mat P\, \mat\Phi\transpose + \mat Q,
+\label{eq:cov-predict}
+\end{equation}
+computed in code as two dense $6\times6$ matrix products (\texttt{tmp = Phi * P}, \texttt{Pnew = tmp * Phi\textsuperscript{T}}). The discrete process-noise matrix $\mat Q$ is diagonal,
+\begin{equation}
+\mat Q = \operatorname{diag}\big(\underbrace{q_g,q_g,q_g}_{\text{attitude}},\ \underbrace{q_b,q_b,q_b}_{\text{bias}}\big),
+\qquad
+q_g = \sigma_{\text{gyro}}^2\,\Delta t, \qquad q_b = \sigma_{\text{bias}}^2\,\Delta t,
+\label{eq:Q}
+\end{equation}
+which is the usual continuous-white-noise-to-discrete-variance conversion $\text{Var} \approx \text{PSD}\times\Delta t$ for a noise power spectral density integrated over one step.
+
+\subsection{Measurement update: the generic vector observation}
+\label{sec:update}
+
+Both the accelerometer correction (observing gravity) and the magnetometer correction (observing the local magnetic field) share \emph{identical} mathematical structure, implemented once in the function \texttt{vector\_update}. The general model is: a known, unit-length reference direction $\vect r_{\text{nav}}$ in the navigation frame (gravity $[0,0,1]\transpose$, or the calibrated magnetic reference $\vect r_{\text{mag}}$) is rotated into the body frame using the \emph{current} attitude estimate, and compared against the actual (normalized) sensor reading.
+
+\subsubsection{Predicted measurement}
+
+\begin{equation}
+\vect v_b = \mat R(\quat)\transpose\, \vect r_{\text{nav}},
+\label{eq:vb}
+\end{equation}
+i.e. the reference vector expressed in the body frame under the current attitude estimate --- this is what the sensor \emph{should} read if $\quat$ were exact.
+
+\subsubsection{Measurement Jacobian}
+
+Because a small attitude perturbation $\delta\vect\theta$ rotates any navigation-frame-derived body vector according to the first-order approximation
+\begin{equation}
+\vect v_b(\delta\vect\theta) \approx \vect v_b + \delta\vect\theta \times \vect v_b = \vect v_b + \skewm{\vect v_b}\,\delta\vect\theta,
+\end{equation}
+the observation is linear in the error state with Jacobian
+\begin{equation}
+\mat H = \begin{bmatrix} \skewm{\vect v_b} & \mat 0_3 \end{bmatrix} \in \R^{3\times6}.
+\label{eq:H}
+\end{equation}
+Only the attitude-error block is directly observed; the bias block is corrected indirectly through the cross-covariance $\mat P_{\theta b}$ built up during propagation.
+
+\subsubsection{Innovation covariance and Kalman gain}
+
+\begin{align}
+\mat S &= \mat H\, \mat P\, \mat H\transpose + \sigma_{\text{noise}}^2\, \mat I_3 \in \R^{3\times3}, \label{eq:S}\\
+\mat K &= \mat P\, \mat H\transpose\, \mat S^{-1} \in \R^{6\times3}, \label{eq:K}
+\end{align}
+where $\sigma_{\text{noise}}^2$ is \texttt{accel\_noise} or \texttt{mag\_noise} depending on the sensor. The $3\times3$ inverse $\mat S^{-1}$ is computed in closed form via the cofactor/adjugate method (\texttt{inv3x3}),
+\begin{equation}
+\mat S^{-1} = \frac{1}{\det\mat S}\,\operatorname{adj}(\mat S),
+\end{equation}
+which is numerically cheap and branch-free for a fixed $3\times3$ size, in contrast to general Gaussian elimination used elsewhere in the codebase for the larger $6\times6$ calibration system.
+
+\subsubsection{Innovation and state correction}
+
+The normalized measurement is $\vect z = \vect m/\lVert\vect m\rVert$ (accelerometer or magnetometer reading), and the innovation (residual) is
+\begin{equation}
+\vect y = \vect z - \vect v_b \in \R^3 .
+\end{equation}
+The error-state correction is
+\begin{equation}
+\delta\vect x = \mat K\, \vect y = \begin{bmatrix}\delta\vect\theta \\ \delta\vect b\end{bmatrix} \in \R^6 .
+\label{eq:dx}
+\end{equation}
+
+\subsubsection{State injection}
+
+The corrected error state is folded back into the nominal state --- multiplicatively for attitude, additively for bias:
+\begin{align}
+\quat &\leftarrow \operatorname{normalize}\Big(\quat \otimes \begin{bmatrix}1 & \tfrac12\delta\theta_x & \tfrac12\delta\theta_y & \tfrac12\delta\theta_z\end{bmatrix}\transpose\Big), \label{eq:qcorrect}\\
+\hat{\vect b} &\leftarrow \hat{\vect b} + \delta\vect b. \label{eq:bcorrect}
+\end{align}
+Equation~\eqref{eq:qcorrect} is the concrete instantiation of \eqref{eq:mekf-correction} and is, again, the defining ``multiplicative'' step of the filter: after every correction the error state is reset to zero (\emph{reset step}, implicit here since $\delta\vect x$ is not itself carried forward) and its information content is transferred entirely into the nominal quaternion.
+
+\subsubsection{Covariance update}
+
+Since the Kalman gain \eqref{eq:K} is computed exactly (not approximately), the simplified (non-Joseph-form) covariance update is used:
+\begin{equation}
+\mat P \leftarrow \mat P - \mat K\, \mat H\, \mat P .
+\label{eq:cov-update}
+\end{equation}
+Exploiting the symmetry of $\mat P$, the code observes that $\mat H \mat P = (\mat P \mat H\transpose)\transpose$, so \eqref{eq:cov-update} is evaluated as \texttt{P -= K * (P*H\textsuperscript{T})\textsuperscript{T}} without recomputing $\mat H\mat P$ from scratch. After the subtraction, the matrix is explicitly re-symmetrized,
+\begin{equation}
+\mat P \leftarrow \tfrac12\big(\mat P + \mat P\transpose\big),
+\label{eq:resymm}
+\end{equation}
+to counteract the asymmetry that single-precision floating-point round-off accumulates over many iterations --- a standard numerical-robustness measure in embedded/real-time Kalman filter implementations.
+
+\subsection{Accelerometer correction: roll and pitch}
+
+The accelerometer update (\texttt{ekf\_update\_accel}) invokes the generic vector update of Section~\ref{sec:update} with the navigation-frame reference
+\begin{equation}
+\vect r_{\text{nav}} = \vect g_{\text{nav}} = \begin{bmatrix}0 & 0 & 1\end{bmatrix}\transpose
+\end{equation}
+(gravity direction, unit-normalized). Prior to the update, the raw accelerometer magnitude is gated:
+\begin{equation}
+\text{reject if}\quad \lVert \vect a_{\text{meas}}\rVert < 0.85\,g \ \ \text{or}\ \ \lVert \vect a_{\text{meas}}\rVert > 1.15\,g .
+\label{eq:accgate}
+\end{equation}
+This heuristic rejects updates while the vehicle undergoes significant linear acceleration, during which the accelerometer no longer measures gravity alone ($\vect a_{\text{meas}} = \vect g - \vect a_{\text{lin}}$ in the body frame) and would otherwise corrupt the attitude estimate. Because gravity is invariant to rotation about the vertical (Z) axis, this correction observes only roll and pitch, leaving yaw unconstrained by the accelerometer alone.
+
+\subsection{Magnetometer correction: heading (yaw)}
+
+The magnetometer update (\texttt{ekf\_update\_mag}) uses the same vector-update mechanism with
+\begin{equation}
+\vect r_{\text{nav}} = \vect r_{\text{mag}} = \texttt{cfg.mag\_ref},
+\end{equation}
+the calibrated, unit-normalized local magnetic field direction expressed in the navigation frame (obtained externally, e.g. from a magnetic-declination table or by defining the navigation frame's north axis as the calibrated field direction itself). Because the magnetic field has a horizontal component, this correction is sensitive to heading and thus constrains the yaw degree of freedom left unobserved by gravity, giving the combined filter full 3-axis attitude observability.
+
+\subsection{Euler angle extraction}
+
+For display or logging, \texttt{ekf\_euler} recovers Z--Y--X (aerospace) Euler angles from the quaternion:
+\begin{align}
+\text{roll } \phi &= \operatorname{atan2}\!\big(2(wx+yz),\, 1-2(x^2+y^2)\big), \\
+\text{pitch } \theta &= \arcsin\!\Big(\operatorname{clip}\big(2(wy-zx),\,-1,\,1\big)\Big), \\
+\text{yaw } \psi &= \operatorname{atan2}\!\big(2(wz+xy),\, 1-2(y^2+z^2)\big),
+\end{align}
+where the argument of $\arcsin$ is clamped to $[-1,1]$ to guard against domain errors from floating-point overshoot near the gimbal-lock singularity at $\theta=\pm90^\circ$.
+
+\subsection{Algorithm summary}
+
+Algorithm~\ref{alg:mekf} summarizes one full filter cycle as implemented across \texttt{ekf\_predict} and \texttt{vector\_update}.
+
+\begin{table}[H]
+\centering
+\caption{One MEKF cycle (prediction + optional corrections).}
+\label{alg:mekf}
+\begin{tabular}{@{}p{0.95\linewidth}@{}}
+\toprule
+\textbf{Predict} (every gyro sample, rate $1/\Delta t$)\\
+\quad 1. $\vect\omega \leftarrow \vect\omega_{\text{meas}} - \hat{\vect b}$ \\
+\quad 2. Integrate $\quat$ with \eqref{eq:qint}; renormalize \\
+\quad 3. Build $\mat\Phi$ via \eqref{eq:Phi} \\
+\quad 4. $\mat P \leftarrow \mat\Phi\mat P\mat\Phi\transpose + \mat Q$ via \eqref{eq:cov-predict}--\eqref{eq:Q}\\
+\midrule
+\textbf{Update (accel)} (when $\lVert\vect a\rVert \approx 1g$, \eqref{eq:accgate}) \\
+\quad 1--6. Apply \eqref{eq:vb}--\eqref{eq:cov-update} with $\vect r_{\text{nav}}=[0,0,1]\transpose$, noise $\sigma_{\text{acc}}^2$ \\
+\midrule
+\textbf{Update (mag)} (whenever a calibrated sample is available) \\
+\quad 1--6. Apply \eqref{eq:vb}--\eqref{eq:cov-update} with $\vect r_{\text{nav}}=\vect r_{\text{mag}}$, noise $\sigma_{\text{mag}}^2$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% =====================================================================
+\section{Magnetometer Hard/Soft-Iron Calibration}
+% =====================================================================
+
+\subsection{Physical motivation}
+
+An uncalibrated magnetometer, rotated through all orientations at a fixed location, does not trace a sphere centered at the origin. Two distortions are present:
+\begin{itemize}
+    \item \textbf{Hard-iron effects}: nearby permanently magnetized material adds a constant offset vector to every reading, \emph{shifting} the sphere's center.
+    \item \textbf{Soft-iron effects}: nearby ferromagnetic (but not permanently magnetized) material locally distorts the ambient field direction- and orientation-dependently, \emph{stretching/shearing} the sphere into a general ellipsoid.
+\end{itemize}
+Both effects, if left uncorrected, make the heading derived from the raw magnetometer vector unusable in the vector-observation update of Section~\ref{sec:update}. The module in \texttt{magcal.c} estimates and removes both effects by fitting an ellipsoid to a cloud of raw samples collected while the sensor is rotated through many orientations.
+
+\subsection{Ellipsoid model}
+
+The calibration assumes an \emph{axis-aligned} ellipsoid model (i.e. no cross-axis/shear terms):
+\begin{equation}
+x^2 + B\,y^2 + C\,z^2 + P\,x + Q\,y + R\,z + D = 0,
+\label{eq:ellipsoid}
+\end{equation}
+where $(x,y,z)$ are raw magnetometer readings (scaled, see below) and $B,C,P,Q,R,D\in\R$ are six unknown parameters to be estimated (the coefficient of $x^2$ is fixed to $1$, which is possible because \eqref{eq:ellipsoid} is defined up to an overall nonzero scale factor).
+
+\subsection{Numerical scaling}
+
+Raw readings are divided by a constant $\texttt{MAG\_SCALE}=50$ before use:
+\begin{equation}
+x = \frac{m_x}{\texttt{MAG\_SCALE}}, \quad y = \frac{m_y}{\texttt{MAG\_SCALE}}, \quad z = \frac{m_z}{\texttt{MAG\_SCALE}}.
+\end{equation}
+This is a purely numerical conditioning step: fourth-order cross terms such as $x^2\!\cdot\! y^2$ appearing in the normal equations grow very quickly with un-scaled raw counts (readings of order $50\,\mu\mathrm{T}$ give $x^4 \sim 6\times10^6$), and summing many such large terms in the accumulators would lose precision even in double arithmetic; rescaling to order unity keeps the normal matrix well conditioned.
+
+\subsection{Least-squares formulation via normal equations}
+
+Rearranging \eqref{eq:ellipsoid} as a linear system in the unknown parameter vector
+\begin{equation}
+\vect v = \begin{bmatrix}B & C & P & Q & R & D\end{bmatrix}\transpose \in \R^6,
+\end{equation}
+each sample $i$ contributes one row
+\begin{equation}
+\vect a_i = \begin{bmatrix} y_i^2 & z_i^2 & x_i & y_i & z_i & 1 \end{bmatrix}, \qquad
+\text{target}_i = -x_i^2,
+\end{equation}
+so that stacking all $N$ samples gives an overdetermined linear system $\mat A \vect v = \vect w$, $\mat A \in \R^{N\times 6}$, solved in the least-squares sense:
+\begin{equation}
+\vect v^{\star} = \operatorname*{arg\,min}_{\vect v \in \R^6} \lVert \mat A \vect v - \vect w \rVert_2^2
+\quad\Longleftrightarrow\quad
+\big(\mat A\transpose \mat A\big)\, \vect v^{\star} = \mat A\transpose \vect w .
+\label{eq:normaleq}
+\end{equation}
+Rather than storing the (potentially very large) design matrix $\mat A$, the code accumulates the $6\times6$ normal matrix and $6\times1$ right-hand side \emph{incrementally}, one sample at a time:
+\begin{equation}
+\mat A\transpose\mat A \;\mathrel{+}=\; \vect a_i \vect a_i\transpose, \qquad
+\mat A\transpose \vect w \;\mathrel{+}=\; \vect a_i \cdot \text{target}_i,
+\label{eq:accumulate}
+\end{equation}
+implemented in \texttt{magcal\_add} as the fixed-size accumulators \texttt{ata[36]} and \texttt{atb[6]}. Because \eqref{eq:accumulate} has constant memory cost independent of the number of samples $N$, arbitrarily many calibration samples can be folded in in a streaming fashion, well suited to the limited RAM of an embedded target. The accumulation is performed in \texttt{double} precision specifically to avoid catastrophic cancellation when summing many terms; the subsequent solve is carried out in \texttt{float}, since by that point the normal matrix is well conditioned.
+
+\subsection{Solving the normal equations by Gauss--Jordan elimination}
+
+The symmetric $6\times6$ system $(\mat A\transpose\mat A)\vect v = \mat A\transpose\vect w$ is solved in \texttt{magcal\_solve} using the routines in \texttt{Gauss\_elimination.c}: \texttt{determinant()} performs elimination with partial pivoting on $\mat A\transpose\mat A$ augmented with the identity matrix $\mat I_6$, and \texttt{inversion()} completes the back-substitution, so that the explicit inverse is used to obtain
+\begin{equation}
+\vect v^{\star} = \big(\mat A\transpose \mat A\big)^{-1} \mat A\transpose \vect w = \begin{bmatrix}B & C & P & Q & R & D\end{bmatrix}\transpose.
+\label{eq:solve}
+\end{equation}
+A zero (or numerically negligible) determinant indicates a rank-deficient normal matrix --- typically from too few or poorly distributed calibration samples --- and causes \texttt{magcal\_solve} to abort.
+
+\subsection{Recovering the ellipsoid center (hard-iron offset)}
+
+Given the fitted coefficients from \eqref{eq:solve}, the implicit equation \eqref{eq:ellipsoid} is converted to center-offset form by completing the square independently on each axis:
+\begin{equation}
+(x-x_0)^2 + B(y-y_0)^2 + C(z-z_0)^2 = K,
+\label{eq:centered}
+\end{equation}
+with
+\begin{equation}
+x_0 = -\frac{P}{2}, \qquad y_0 = -\frac{Q}{2B}, \qquad z_0 = -\frac{R}{2C}, \qquad
+K = x_0^2 + B y_0^2 + C z_0^2 - D .
+\label{eq:center}
+\end{equation}
+The point $(x_0,y_0,z_0)$, rescaled back to raw units, is precisely the \textbf{hard-iron offset} \texttt{c->offset[3]}:
+\begin{equation}
+\texttt{offset} = \big(x_0,\,y_0,\,z_0\big)\cdot\texttt{MAG\_SCALE}.
+\end{equation}
+Two validity checks are enforced before accepting the fit:
+\begin{itemize}
+    \item $B>\varepsilon$ and $C>\varepsilon$ (with $\varepsilon=10^{-6}$): a non-positive quadratic coefficient means the fitted quadric is a hyperboloid rather than an ellipsoid, indicating the calibration samples did not sufficiently cover the sphere of orientations;
+    \item $K>\varepsilon'$ (with $\varepsilon'=10^{-9}$): a non-positive $K$ indicates a degenerate (zero- or imaginary-radius) fit.
+\end{itemize}
+
+\subsection{Recovering the per-axis scale (soft-iron correction)}
+
+From \eqref{eq:centered}, the semi-axis lengths of the fitted ellipsoid are
+\begin{equation}
+a_x = \sqrt{K}, \qquad a_y = \sqrt{K/B}, \qquad a_z = \sqrt{K/C}.
+\end{equation}
+Dividing each centered coordinate by its own semi-axis length maps the ellipsoid onto the unit sphere, which defines the per-axis \textbf{soft-iron scale factors} \texttt{c->scale[3]}:
+\begin{equation}
+\texttt{scale}_x = \frac{1}{a_x \cdot \texttt{MAG\_SCALE}}, \qquad
+\texttt{scale}_y = \frac{1}{a_y \cdot \texttt{MAG\_SCALE}}, \qquad
+\texttt{scale}_z = \frac{1}{a_z \cdot \texttt{MAG\_SCALE}} .
+\label{eq:scale}
+\end{equation}
+
+\subsection{Applying the calibration}
+
+Given the solved offset and scale, any raw sample is corrected by the affine map (\texttt{magcal\_apply})
+\begin{equation}
+\text{out}_i = \big(\text{raw}_i - \texttt{offset}_i\big) \cdot \texttt{scale}_i, \qquad i \in \{x,y,z\},
+\label{eq:apply}
+\end{equation}
+which removes the hard-iron shift and normalizes each axis by its soft-iron scale, producing an (approximately) unit-length calibrated field vector directly usable as the measurement $\vect m$ in the magnetometer vector-update of Section~\ref{sec:update}.
+
+% =====================================================================
+\section{Hardware Interface Layer}
+\label{sec:port}
+% =====================================================================
+
+The file \texttt{imu\_port.c} performs unit conversion only, with no estimation mathematics of its own, and is included here for completeness since it fixes the physical units used throughout Sections~3--4:
+
+\begin{itemize}
+    \item Gyroscope: converted from $\mathrm{deg/s}$ (as reported by the vendor driver) to $\mathrm{rad/s}$ via multiplication by $\pi/180 \approx 0.0174533$, matching the units expected by \texttt{ekf\_predict}.
+    \item Accelerometer: left in units of $g$, matching the $\pm1\,g$ gating logic of \eqref{eq:accgate} and the unit-gravity reference $\vect g_{\text{nav}}=[0,0,1]\transpose$.
+    \item Magnetometer: read in raw counts scaled by the driver's \texttt{MMult} factor ($0.1\,\mu\mathrm{T}$ per count), then passed through \texttt{magcal\_apply} \eqref{eq:apply} when a valid calibration exists; the absolute physical unit is otherwise immaterial since the vector-update measurement model only uses the \emph{normalized} direction $\vect z = \vect m/\lVert \vect m\rVert$.
+    \item Sample interval $\Delta t$ is measured from consecutive millisecond timestamps and gated to $0 < \Delta t < 0.5\,\mathrm{s}$, rejecting the first sample after initialization and any implausibly large gap (e.g. after a stall).
+\end{itemize}
+
+% =====================================================================
+\section{Discussion}
+% =====================================================================
+
+The two algorithms analyzed above are textbook instances of well-established techniques, combined into a compact, dependency-free embedded implementation:
+
+\begin{itemize}
+    \item The attitude filter is a standard \textbf{6-state indirect (error-state) multiplicative EKF} for quaternion attitude with gyro bias estimation, structurally equivalent to the formulations used in spacecraft attitude determination (Lefferts, Shuster \& Markley, 1982) and in many open-source low-cost AHRS/autopilot stacks. Its two measurement updates realize a \textbf{TRIAD-style vector-matching correction}: the accelerometer observes the gravity direction (correcting roll/pitch, gated against non-gravitational acceleration), and the magnetometer observes the local field direction (correcting yaw), the two together restoring full 3-axis observability that the gyroscope alone cannot provide due to unbounded integration drift.
+    \item The magnetometer calibration is a standard \textbf{linear least-squares ellipsoid fit} solved through the \textbf{normal equations}, with the accumulation performed \emph{incrementally} (constant memory) and the fit solved by direct \textbf{Gauss--Jordan elimination/matrix inversion}. The resulting affine correction removes both hard-iron (additive) and soft-iron (axis-scaling) distortion, a prerequisite for any downstream heading computation.
+\end{itemize}
+
+A minor point of numerical interest is the deliberate departure from the theoretically more robust \emph{Joseph-form} covariance update in favor of the simpler form \eqref{eq:cov-update}: this is justified here because the Kalman gain is computed exactly (no approximation or numerical truncation beyond ordinary floating-point rounding), so the simplified form is mathematically equivalent; the subsequent re-symmetrization step \eqref{eq:resymm} is a pragmatic safeguard against the asymmetry that single-precision arithmetic otherwise accumulates over long runtimes on a microcontroller.
+
+% =====================================================================
+\section*{Symbol Glossary}
+\addcontentsline{toc}{section}{Symbol Glossary}
+% =====================================================================
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}llp{0.62\linewidth}@{}}
+\toprule
+\textbf{Symbol} & \textbf{Source var.} & \textbf{Meaning} \\
+\midrule
+$\quat=[w,x,y,z]\transpose$ & \texttt{f->q[4]} & Unit quaternion, body $\to$ navigation frame rotation (Hamilton, scalar-first) \\
+$\mat R(\quat)$ & \texttt{quat\_to\_R} & $3\times3$ rotation matrix equivalent of $\quat$ \\
+$\vect\omega$ & \texttt{w[3]} & Bias-corrected body-frame angular rate (rad/s) \\
+$\vect\omega_{\text{meas}}$ & \texttt{gyro[3]} & Raw gyroscope measurement (rad/s) \\
+$\hat{\vect b}$ & \texttt{f->bias[3]} & Estimated gyro bias (rad/s) \\
+$\delta\vect\theta$ & \texttt{dx[0:3]} & Small-angle attitude error (rad), part of Kalman error state \\
+$\delta\vect b$ & \texttt{dx[3:6]} & Gyro bias error (rad/s), part of Kalman error state \\
+$\delta\vect x$ & \texttt{dx[6]} & Full $6$-dimensional error state $=[\delta\vect\theta;\delta\vect b]$ \\
+$\skewm{\vect v}$ & --- & $3\times3$ skew-symmetric cross-product matrix of $\vect v$, s.t. $\skewm{\vect v}\vect u = \vect v\times\vect u$ \\
+$\mat P$ & \texttt{f->P[36]} & $6\times6$ error-state covariance matrix \\
+$\mat\Phi$ & \texttt{Phi[36]} & Discrete state-transition matrix, $\approx \mat I + \mat F\Delta t$ \\
+$\mat Q$ & (inline) & Discrete process-noise covariance, diag.\ from $\sigma_{\text{gyro}},\sigma_{\text{bias}}$ \\
+$\sigma_{\text{gyro}}$ & \texttt{cfg.gyro\_noise} & Gyro angular-random-walk density (rad/s/$\sqrt{\mathrm{Hz}}$) \\
+$\sigma_{\text{bias}}$ & \texttt{cfg.bias\_noise} & Gyro bias rate-random-walk density (rad/s$^2$/$\sqrt{\mathrm{Hz}}$) \\
+$\sigma_{\text{acc}}^2$ & \texttt{cfg.accel\_noise} & Accelerometer measurement-noise variance (normalized units) \\
+$\sigma_{\text{mag}}^2$ & \texttt{cfg.mag\_noise} & Magnetometer measurement-noise variance (normalized units) \\
+$\vect r_{\text{mag}}$ & \texttt{cfg.mag\_ref[3]} & Unit local magnetic-field reference direction, nav.\ frame \\
+$\vect g_{\text{nav}}$ & \texttt{g\_nav[3]} & Unit gravity reference direction, nav.\ frame $=[0,0,1]\transpose$ \\
+$\vect v_b$ & \texttt{vb[3]} & Reference vector rotated into the body frame $=\mat R\transpose\vect r_{\text{nav}}$ (predicted measurement) \\
+$\mat H$ & \texttt{H[3x6]} & Measurement Jacobian, $[\skewm{\vect v_b}\ \ \mat 0_3]$ \\
+$\mat S$ & \texttt{S[9]} & Innovation covariance, $\mat H\mat P\mat H\transpose + \sigma_{\text{noise}}^2\mat I_3$ \\
+$\mat K$ & \texttt{K[Nx3]} & Kalman gain, $\mat P\mat H\transpose\mat S^{-1}$ \\
+$\vect z$ & \texttt{z[3]} & Normalized sensor measurement (unit accel.\ or unit mag.\ reading) \\
+$\vect y$ & \texttt{y[3]} & Innovation/residual, $\vect z-\vect v_b$ \\
+$B,C,P,Q,R,D$ & \texttt{v[0..5]} & Fitted ellipsoid coefficients (magcal): quadratic ($B,C$), linear ($P,Q,R$), constant ($D$) \\
+$x_0,y_0,z_0$ & \texttt{c->offset[3]} & Ellipsoid center = hard-iron offset (raw units) \\
+$K$ (magcal) & (inline \texttt{K}) & Constant from completing the square; determines semi-axis lengths \\
+$a_x,a_y,a_z$ & (inline) & Fitted ellipsoid semi-axis lengths \\
+$\texttt{scale}_x,\texttt{scale}_y,\texttt{scale}_z$ & \texttt{c->scale[3]} & Per-axis soft-iron normalization factors \\
+$\mat A\transpose\mat A,\ \mat A\transpose\vect w$ & \texttt{ata[36]}, \texttt{atb[6]} & Accumulated normal-equation matrix/vector (magcal) \\
+\texttt{MAG\_SCALE} & (\#define, $=50$) & Numerical pre-scaling factor for calibration samples \\
+\bottomrule
+\end{tabular}
+\caption{Complete symbol glossary cross-referenced to source-code identifiers.}
+\end{table}
+
+% =====================================================================
+\section*{Conclusion}
+\addcontentsline{toc}{section}{Conclusion}
+% =====================================================================
+
+The \texttt{43-STM32Fxxx\_MPU9250\_EKF} module implements a compact but mathematically complete AHRS stack: a $6$-state multiplicative Extended Kalman Filter propagates orientation and gyro bias from angular-rate integration and corrects them with gated, TRIAD-style vector observations of gravity and the local magnetic field; a separate, incrementally-accumulated least-squares ellipsoid fit, solved by Gauss--Jordan elimination, calibrates out hard-iron and soft-iron magnetometer distortion so that its output is suitable as an EKF measurement. Both algorithms are implemented with attention to the numerical realities of embedded single-precision arithmetic --- explicit renormalization of the quaternion, re-symmetrization of the covariance, double-precision accumulation of the calibration normal equations, and closed-form small-matrix inversions in place of general-purpose solvers where the matrix size permits it.
+
+\end{document}
